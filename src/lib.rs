@@ -1,6 +1,7 @@
 use anyhow::anyhow;
-use fast_image_resize as fr;
-use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb, Rgba, RgbaImage};
+use fast_image_resize::images::Image as FrImage;
+use fast_image_resize::{FilterType, MulDiv, ResizeAlg, ResizeOptions, Resizer};
+use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb, Rgba};
 use ndarray::{s, Array3, ArrayView, Axis, Dim};
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -151,7 +152,7 @@ fn postprocess_image(
         .ok_or(anyhow!("Should be OK"))?;
     let result = (model_result.mapv(|x| x - mi) / (ma - mi)) * 255.0;
 
-    let result_u8 = result.mapv(|x| x as u8).into_raw_vec();
+    let result_u8 = result.mapv(|x| x as u8).into_raw_vec_and_offset().0;
 
     let mut imgbuf: ImageBuffer<Rgb<u8>, Vec<u8>> =
         ImageBuffer::new(ML_MODEL_IMAGE_WIDTH, ML_MODEL_IMAGE_HEIGHT);
@@ -172,51 +173,50 @@ fn resize_rgba(
 ) -> anyhow::Result<Vec<u8>> {
     let width = NonZeroU32::new(img.width()).ok_or(anyhow!("Incorrect image width"))?;
     let height = NonZeroU32::new(img.height()).ok_or(anyhow!("Incorrect image height"))?;
-    let mut src_image = fr::Image::from_vec_u8(
-        width,
-        height,
+    let mut src_image = FrImage::from_vec_u8(
+        width.into(),
+        height.into(),
         img.to_rgba8().into_raw(),
-        fr::PixelType::U8x4,
+        fast_image_resize::PixelType::U8x4,
     )?;
 
     // Multiple RGB channels of source image by alpha channel
-    let alpha_mul_div = fr::MulDiv::default();
-    alpha_mul_div.multiply_alpha_inplace(&mut src_image.view_mut())?;
+    let alpha_mul_div = MulDiv::default();
+    alpha_mul_div.multiply_alpha_inplace(&mut src_image)?;
 
     // Create container for data of destination image
     let dst_width = NonZeroU32::new(target_width).ok_or(anyhow!("Incorrect target image width"))?;
     let dst_height =
         NonZeroU32::new(target_height).ok_or(anyhow!("Incorrect target image height"))?;
-    let mut dst_image = fr::Image::new(dst_width, dst_height, src_image.pixel_type());
-
-    // Get mutable view of destination image data
-    let mut dst_view = dst_image.view_mut();
+    let mut dst_image = FrImage::new(dst_width.into(), dst_height.into(), src_image.pixel_type());
 
     // Create Resizer instance and resize source image
     // into buffer of destination image
-    let mut resizer = fr::Resizer::new(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear));
-    resizer.resize(&src_image.view(), &mut dst_view)?;
+    let mut resizer = Resizer::new();
+    let mut resize_options = ResizeOptions::default();
+    resize_options.algorithm = ResizeAlg::Convolution(FilterType::Bilinear);
+    resizer.resize(&src_image, &mut dst_image, Some(&resize_options))?;
 
     // Divide RGB channels of destination image by alpha
-    alpha_mul_div.divide_alpha_inplace(&mut dst_view)?;
+    alpha_mul_div.divide_alpha_inplace(&mut dst_image)?;
 
-    Ok(dst_image.into_vec())
+    // Get mutable view of destination image data
+    let dst_view = dst_image.into_vec();
+
+    Ok(dst_view)
 }
 
 fn apply_mask(original_image: &DynamicImage, mask_image: &DynamicImage) -> DynamicImage {
     // Create a new transparent image
-    let mut no_bg_image: RgbaImage = ImageBuffer::new(mask_image.width(), mask_image.height());
+    let mut no_bg_image = ImageBuffer::new(mask_image.width(), mask_image.height());
 
     // Manually apply the mask and overlay the original image
     for (x, y, pixel) in no_bg_image.enumerate_pixels_mut() {
         let orig_pixel = original_image.get_pixel(x, y);
-        *pixel = Rgba([
-            orig_pixel[0],
-            orig_pixel[1],
-            orig_pixel[2],
-            mask_image.get_pixel(x, y)[0],
-        ]);
+        let mask_pixel = mask_image.get_pixel(x, y);
+        *pixel = Rgba([orig_pixel[0], orig_pixel[1], orig_pixel[2], mask_pixel[0]]);
     }
+
     DynamicImage::ImageRgba8(no_bg_image)
 }
 
